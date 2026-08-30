@@ -251,6 +251,10 @@ auto Interface::read(uint24 address) -> uint8 {
   return cpu.readDisassembler(address);
 }
 
+auto Interface::writeWorkRam(uint17 address, uint8 data) -> void {
+  cpu.writeRAM(address, data);
+}
+
 auto Interface::cheats(const vector<string>& list) -> void {
   if(cartridge.has.ICD) {
     icd.cheats.assign(list);

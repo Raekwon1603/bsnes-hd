@@ -86,6 +86,17 @@ struct Interface {
 
   //cheat functions
   virtual auto read(uint24 address) -> uint8 { return 0; }
+  //  writes a single byte of system work RAM ($7E:0000-$7F:FFFF) - not the
+  //  general bus write() a real cheat-code engine would need (arbitrary
+  //  cartridge/SRAM regions map very differently per game/chip, real
+  //  complexity a frontend has no business doing on its own - see
+  //  target-libretro/libretro.cpp's retro_get_memory_data comment on this
+  //  same tradeoff for the read side). Added alongside read() above for the
+  //  Super Metroid Android fork's second-screen companion display to write
+  //  a live game-state field directly (e.g. which ammo type is armed) the
+  //  same way pressing a real controller button would - see that project's
+  //  docs/retroarch-fork-notes.md.
+  virtual auto writeWorkRam(uint17 address, uint8 data) -> void {}
   virtual auto cheats(const vector<string>& = {}) -> void {}
 
   //configuration

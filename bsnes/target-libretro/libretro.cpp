@@ -2,6 +2,16 @@
 #include "libretro.h"
 #include "libretro_core_options.h"
 #include <emulator/hdtoolkit.hpp>
+/* For the WRAM shadow buffer used by retro_get_memory_data/_size below - see
+ * the comment above those two functions. Including sfc/cpu/cpu.hpp or
+ * sfc/sfc.hpp directly here causes real "redefinition of Interface/ID/
+ * Configuration/Settings" errors: sfc.hpp's own chain re-declares types that
+ * program.cpp's #include <sfc/interface/interface.hpp> (below) already
+ * declared, and they are not designed to both be included in one
+ * translation unit. Reading real WRAM instead goes through the existing
+ * `emulator` global (Emulator::Interface*, declared in program.cpp,
+ * included below) and its already-public, already-used read(uint24) API -
+ * see where retro_get_memory_data/_size actually use it, further down. */
 
 static retro_environment_t environ_cb;
 static retro_video_refresh_t video_cb;
@@ -10,6 +20,12 @@ static retro_audio_sample_batch_t audio_batch_cb;
 static retro_input_poll_t input_poll;
 static retro_input_state_t input_state;
 static retro_log_printf_t libretro_print;
+
+/* Forward declaration - real definition is further down, next to
+ * retro_get_memory_data/_size (search for its own comment there). Called
+ * from the end of retro_run(), which is defined before that point in this
+ * file. */
+static void smwide_refresh_wram_shadow();
 
 #define SAMPLERATE 48000
 #define AUDIOBUFSIZE (SAMPLERATE/50) * 2
@@ -956,6 +972,12 @@ void retro_run()
 		emulator->run();
 	else
 		run_with_runahead(run_ahead_frames);
+
+	/* Keeps the WRAM shadow buffer (retro_get_memory_data/_size, further
+	 * down) fresh as of this just-completed frame - see that function's own
+	 * comment for why this moved here instead of refilling inline on every
+	 * read. */
+	smwide_refresh_wram_shadow();
 }
 
 size_t retro_serialize_size()
@@ -1125,14 +1147,83 @@ unsigned retro_get_region()
 	return program->superFamicom.region == "NTSC" ? RETRO_REGION_NTSC : RETRO_REGION_PAL;
 }
 
-// Currently, there is no safe/sensible way to use the memory interface without severe hackery.
-// Rely on higan to load and save SRAM until there is really compelling reason not to.
+// The general memory interface (arbitrary SRAM/cartridge-mapped regions
+// across every supported cart type) really is severe hackery to expose
+// safely - left alone, per the original comment this replaced. System work
+// RAM is a much simpler, real special case: it's a fixed 128KB region
+// ($7E:0000-$7F:FFFF) that exists identically for every game. This is what
+// a second-screen companion display (see super_metroid-android's
+// docs/retroarch-fork-notes.md) needs to read real game state (health,
+// missiles, etc.) from this core specifically, since it does not otherwise
+// expose any live memory to the frontend (neither this legacy API nor
+// RETRO_ENVIRONMENT_SET_MEMORY_MAPS, which this core never calls).
+//
+// There's no live pointer into WRAM to hand back directly (the internal sfc
+// headers that would expose one - sfc/cpu/cpu.hpp's `cpu.wram` - can't be
+// safely included in this translation unit alongside program.cpp's
+// sfc/interface/interface.hpp: real "redefinition" errors, they are not
+// designed to coexist in one file). Instead this fills a shadow buffer by
+// reading through the same safe, existing, already-public
+// Emulator::Interface::read(uint24) API interface.cpp's own read() uses
+// (cpu.readDisassembler - a side-effect-free bus read, same as bsnes's own
+// debugger/disassembler relies on).
+//
+// Originally refilled inline inside retro_get_memory_data() itself, on
+// every single call - simple, but a real, measured-on-device cost: the
+// Super Metroid Android fork's second-screen companion display (see
+// docs/retroarch-fork-notes.md in that project) polls this several times a
+// second, and each call meant 128K individual bus reads. Moved the refill
+// to smwide_refresh_wram_shadow(), called once per emulated frame from the
+// end of retro_run() (below) instead - decouples "how often something
+// reads the shadow buffer" from "how expensive each refill is": the buffer
+// is always at most one frame (~16ms) stale regardless of poll rate, and
+// retro_get_memory_data() itself becomes a cheap, instant pointer return
+// again, same cost as any other core's implementation of this function.
+static uint8_t smwide_wram_shadow[128 * 1024];
+
+static void smwide_refresh_wram_shadow()
+{
+	if(!emulator || !emulator->loaded()) return;
+	for(unsigned i = 0; i < sizeof(smwide_wram_shadow); i++)
+		smwide_wram_shadow[i] = emulator->read(0x7E0000 + i);
+}
+
 void *retro_get_memory_data(unsigned id)
 {
+	if(id == RETRO_MEMORY_SYSTEM_RAM) return smwide_wram_shadow;
 	return nullptr;
 }
 
 size_t retro_get_memory_size(unsigned id)
 {
+	if(id == RETRO_MEMORY_SYSTEM_RAM) return sizeof(smwide_wram_shadow);
 	return 0;
+}
+
+/* Custom export, NOT part of the standard libretro API - there is no
+ * standard "write memory" call, unlike retro_get_memory_data's read side
+ * (see that function's own comment). RetroArch's own nativeWriteSystemRam
+ * JNI bridge resolves this by name (dylib_proc, same generic dlsym-style
+ * mechanism it already uses to resolve every standard retro_* export) -
+ * see docs/retroarch-fork-notes.md in the super_metroid-android project
+ * this is built for. Writes a single byte directly into real, live SNES
+ * work RAM via Interface::writeWorkRam (added specifically for this - see
+ * emulator/interface.hpp/sfc/interface/interface.cpp), the same real
+ * writeRAM() the emulator's own hardware-accurate memory bus uses - not a
+ * shadow-buffer write like retro_get_memory_data's returned pointer (that
+ * buffer is overwritten wholesale from real WRAM every frame - see
+ * smwide_refresh_wram_shadow above - so writing there would just be
+ * silently discarded on the very next frame). address is a flat WRAM
+ * offset (0-0x1FFFF, i.e. $7E:0000-$7F:FFFF), matching the same convention
+ * nativeReadSystemRam already uses. */
+extern "C" RETRO_API void smwide_write_wram(unsigned address, unsigned char data)
+{
+	if(!emulator || !emulator->loaded()) return;
+	if(address >= 128 * 1024) return;
+	emulator->writeWorkRam(address, data);
+	/* Keep the shadow buffer in sync too, so a read immediately after a
+	 * write (before the next retro_run()) sees the new value rather than a
+	 * stale one - a second-screen tap-to-arm that reads back its own write
+	 * before the next frame completes should see what it just set. */
+	smwide_wram_shadow[address] = data;
 }
