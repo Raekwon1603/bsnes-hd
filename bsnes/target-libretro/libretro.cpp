@@ -1227,3 +1227,25 @@ extern "C" RETRO_API void smwide_write_wram(unsigned address, unsigned char data
 	 * before the next frame completes should see what it just set. */
 	smwide_wram_shadow[address] = data;
 }
+
+/* Custom export, same reasoning/resolution mechanism as smwide_write_wram
+ * above (dylib_proc by name, not a standard libretro call). Real bug this
+ * fixes: this core only ever calls program->save() (Program::save(),
+ * program.cpp - the real save-file write path, writes through to the
+ * .srm RetroArch gave via GET_SAVE_DIRECTORY) from retro_unload_game(),
+ * which RetroArch only calls when content is unloaded CLEANLY (backing out
+ * to RetroArch's own menu, or quitting it properly) - never on an Android
+ * task swipe-away, force-close, or crash. Confirmed on real hardware: an
+ * in-game Super Metroid save (at a save station, "completed the intro")
+ * produced no .srm write at all when the app was just closed normally,
+ * with the .srm file's mtime unchanged - not a save-slot bug, this whole
+ * mechanism silently never fires outside a clean RetroArch-menu exit. This
+ * export lets a frontend force a real save on its own timing instead (see
+ * super_metroid-android's docs/retroarch-fork-notes.md for where this is
+ * called from - RetroActivityFuture's onPause/onStop, the actual moment
+ * the app is being backgrounded/closed, not a blind periodic timer). */
+extern "C" RETRO_API void smwide_force_save(void)
+{
+	if(!emulator || !emulator->loaded()) return;
+	program->save();
+}
