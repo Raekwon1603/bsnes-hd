@@ -1,3 +1,118 @@
+// "HIDE MAIN HUD" second-screen setting (see libretro.cpp's
+// smwide_set_hud_hidden and the SETUP tab in the dual-screen fork - see
+// super_metroid-android's docs/retroarch-fork-notes.md). Same technique
+// that project's own hand-rolled SNES core uses in its src/snes/dma.c
+// (see that file's own long comment for the full why): Super Metroid's
+// HUD tilemap lives at a fixed WRAM address ($7E:C608, 192 bytes) and is
+// DMA'd into VRAM fresh every frame by the ROM's own HandleHudTilemap
+// routine - so intercepting the DMA transfer at the moment it copies
+// those specific WRAM bytes into the VRAM data port ($2118/$2119) and
+// substituting a blank tile lets the WRAM side (and all the game's own
+// read-modify-write HUD bookkeeping against it) stay completely
+// untouched, while nothing ever reaches the screen. This is cosmetic
+// only - it never alters CPU-visible memory state - so it doesn't
+// conflict with RetroAchievements hardcore mode the way save states or
+// memory patching would.
+//
+// The static minimap border/frame graphic (InitializeHud, ROM $80:988B,
+// 64 bytes) is DMA'd from ROM directly to a fixed VRAM address once per
+// room entry, separately from hud_tilemap - filtered here too so it
+// doesn't linger on screen after the toggle switches on.
+bool g_smwide_hud_hidden = false;
+static constexpr uint8_t kHudTilemapWramBank = 0x7e;
+static constexpr uint16_t kHudTilemapWramAddr = 0xc608;
+static constexpr uint16_t kHudTilemapWramSize = 192;
+static constexpr uint8_t kHudMinimapBorderRomBank = 0x80;
+static constexpr uint16_t kHudMinimapBorderRomAddr = 0x988b;
+static constexpr uint16_t kHudMinimapBorderRomSize = 0x40;
+// Fixed VRAM destination for the minimap border/frame DMA above (see
+// InitializeHud, sm_80.c: WriteRegWord(VMADDL, addr_unk_605800) right
+// before that transfer) - a literal in the ROM's own code, unlike
+// hud_tilemap's own VRAM destination which has to be discovered at
+// runtime (see g_smwideHudTilemapVramDst below).
+static constexpr uint16_t kHudMinimapBorderVramDst = 0x5800;
+
+// Latched the first time transfer() sees hud_tilemap's own DMA go by
+// (0xffff = not seen yet this session) - hud_tilemap's VRAM destination
+// is stable across frames (same BG3 tilemap base for as long as the
+// current room's HUD is up), so this lets smwide_force_blank_hud (called
+// from libretro.cpp's smwide_set_hud_hidden) force-blank whatever's
+// already sitting in VRAM the instant the toggle flips on, not just gate
+// future per-frame writes. Without this, a mostly-static element that's
+// only DMA'd once in a while (the minimap border, or hud_tilemap itself
+// right after a room's InitializeHud runs, before the toggle was ever
+// switched on) sits there stale and visible until something else
+// happens to trigger a re-upload - confirmed on real hardware: the
+// minimap's row of dots in the corner stayed put through the whole
+// Ceres Station opening cutscene even with the toggle already on,
+// because InitializeHud's one-time DMA had already happened before the
+// player ever reached the second screen's SETUP tab.
+static uint16_t g_smwideHudTilemapVramDst = 0xffff;
+
+// Real bug found and fixed after that first attempt still left the dots
+// showing: this core runs TWO independent PPU implementations - sfc/ppu
+// (cycle-accurate) and sfc/ppu-fast (PPUfast, performance-focused, the
+// one HD/widescreen mode's own background-extension code actually lives
+// in) - selected at runtime by System::fastPPU() (hacks.fastPPU,
+// defaults ON, "recommended to leave active" per this core's own
+// options text). sfc/ppu's PPU::load()/power() delegate straight through
+// to the global `ppufast` instance whenever fast mode is active (see
+// sfc/ppu/ppu.cpp) - and each implementation owns its OWN separate vram
+// array and io.vramAddress register copy, not shared. The original
+// version of this patch only ever wrote into sfc/ppu's own `ppu.vram`/
+// read `ppu`'s own io.vramAddress via forceBlankVramWord/
+// vramWriteAddress (see PPU::forceBlankVramWord's own comment,
+// sfc/ppu/ppu.hpp) - which is the INACTIVE copy whenever fast mode is on
+// (the real default), so those force-blank writes never reached the
+// buffer actually being scanned out.
+//
+// PPUfast's own vram/io fields are public (no private: section follows
+// PPUfast's own public: in sfc/ppu-fast/ppu.hpp), but its vramAddress()/
+// vramExt() *methods* are declared `alwaysinline` (inline
+// __attribute__((always_inline))) with their bodies defined out-of-line
+// in ppu-fast/io.cpp and ppu-fast/ppu.cpp - visible only within THAT
+// translation unit (ppu-fast/ppu.cpp's own #include chain), not from
+// here (cpu.cpp's TU, which dma.cpp is #included into) - calling them
+// from here links but leaves them "undefined symbol" at the real
+// per-TU-emitted inline body, since always_inline blocks the normal
+// external-call fallback plain inline functions get. So this replicates
+// PPUfast::vramAddress()'s own real logic (ppu-fast/io.cpp) directly
+// against its public io/vram fields instead of calling the method -
+// safe, since those are plain data reads, not calls into
+// always_inline-only bodies. Simplified for the vramMapping==0 case
+// (linear addressing, mode 1-3's interleaved remapping don't apply to
+// hud_tilemap's simple sequential DMA - see kHudTilemaps_Row1to3's own
+// straight per-word writes, sm_80.c) - vramExt itself
+// (configuration.hacks.ppu.mode7.vramExt, plain field, defaults 0x7fff)
+// is read directly for the same reason.
+auto smwide_hud_tilemap_vram_dst() -> uint {
+  if(!system.fastPPU()) return ppu.vramWriteAddress();
+  return ppufast.io.vramAddress & configuration.hacks.ppu.mode7.vramExt;
+}
+
+// Called from libretro.cpp's smwide_set_hud_hidden the moment the toggle
+// switches on - force-blanks whatever's already sitting in VRAM right
+// now for both elements transfer() otherwise only gates FUTURE writes
+// for (see g_smwideHudTilemapVramDst's own comment above for why this
+// needs to exist at all).
+auto smwide_force_blank_hud() -> void {
+  if(g_smwideHudTilemapVramDst != 0xffff) {
+    for(uint w = 0; w < 96; w++) {
+      uint addr = (g_smwideHudTilemapVramDst + w) & 0x7fff;
+      if(system.fastPPU()) ppufast.vram[addr] = 0x2c0f;
+      else ppu.forceBlankVramWord(addr, 0x2c0f);
+    }
+  }
+  //Static minimap border/frame graphic - fixed VRAM destination
+  //(kHudMinimapBorderVramDst), unlike hud_tilemap's own dest which has
+  //to be discovered at runtime (see above).
+  for(uint w = 0; w < kHudMinimapBorderRomSize / 2; w++) {
+    uint addr = (kHudMinimapBorderVramDst + w) & 0x7fff;
+    if(system.fastPPU()) ppufast.vram[addr] = 0x2c0f;
+    else ppu.forceBlankVramWord(addr, 0x2c0f);
+  }
+}
+
 auto CPU::dmaEnable() -> bool {
   for(auto& channel : channels) if(channel.dmaEnable) return true;
   return false;
@@ -97,6 +212,35 @@ auto CPU::Channel::transfer(uint24 addressA, uint2 index) -> void {
   cpu.r.mar = addressA;
   if(direction == 0) {
     auto data = readA(addressA);
+    if(addressB == 0x18 || addressB == 0x19) {
+      uint8 bank = addressA >> 16;
+      uint16 offset = addressA;
+      bool isHudTilemap = bank == kHudTilemapWramBank
+          && offset >= kHudTilemapWramAddr && offset < kHudTilemapWramAddr + kHudTilemapWramSize;
+      bool isMinimapBorder = bank == kHudMinimapBorderRomBank
+          && offset >= kHudMinimapBorderRomAddr && offset < kHudMinimapBorderRomAddr + kHudMinimapBorderRomSize;
+      if(isHudTilemap) {
+        //Latch this transfer's VRAM destination (pre-increment - the
+        //word about to be written lands here) unconditionally, even
+        //while the toggle is off, so smwide_force_blank_hud can force-
+        //blank it the instant the toggle flips on - see
+        //g_smwideHudTilemapVramDst's own comment above. Reads through
+        //whichever PPU implementation is actually live (see
+        //smwide_hud_tilemap_vram_dst's own comment) - this transfer's
+        //own writeB call further down already goes through the real
+        //bus dispatch and reaches the right one on its own, but this
+        //latch needs to explicitly pick the right io.vramAddress copy.
+        g_smwideHudTilemapVramDst = smwide_hud_tilemap_vram_dst() & 0x7ffe;
+      }
+      if(g_smwide_hud_hidden && isHudTilemap) {
+        //blank tile 0x2c0f, same backdrop tile the ROM's own HUD-fill
+        //routine uses for every empty HUD position - low byte first,
+        //matching the tilemap's little-endian word layout.
+        data = ((offset - kHudTilemapWramAddr) & 1) ? 0x2c : 0x0f;
+      } else if(g_smwide_hud_hidden && isMinimapBorder) {
+        data = ((offset - kHudMinimapBorderRomAddr) & 1) ? 0x2c : 0x0f;
+      }
+    }
     writeB(addressB, data, valid);
   } else {
     auto data = readB(addressB, valid);

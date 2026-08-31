@@ -29,6 +29,34 @@ struct PPU : Thread, PPUcounter {
   //serialization.cpp
   auto serialize(serializer&) -> void;
 
+  // Same reasoning as forceBlankVramWord below (defined out-of-line,
+  // after this class closes - see that function's own comment for why
+  // either of these needs to exist at all) - io.vramAddress (VMADDL/
+  // VMADDH, $2116/$2117) is also private, and CPU::Channel::transfer
+  // needs to read it to latch hud_tilemap's own DMA destination (see
+  // g_smwideHudTilemapVramDst in dma.cpp).
+  alwaysinline auto vramWriteAddress() const -> uint16 { return io.vramAddress; }
+
+  // Backs the second-screen "HIDE MAIN HUD" toggle (see
+  // super_metroid-android's docs/retroarch-fork-notes.md and
+  // sfc/cpu/dma.cpp's own long comment on g_smwide_hud_hidden). vram is
+  // private to this class (see below) with no existing public accessor,
+  // so CPU::Channel::transfer (dma.cpp - not a friend of PPU) can't reach
+  // it directly the way PPU's own nested classes (Background/Object,
+  // friended below) do. This lets it force a word directly into VRAM the
+  // instant the toggle flips on mid-room, to blank a mostly-static
+  // element (the minimap border/frame - InitializeHud DMAs it once per
+  // room entry, not every frame) that would otherwise sit there stale
+  // and visible until something else happens to re-upload it - same
+  // problem and fix as SM2_SetHudHidden's own real comment on the
+  // original from-scratch SNES core this fork's DMA intercept is ported
+  // from. Defined out-of-line, after this class closes: vram's own
+  // VRAM::operator[] has a deduced (auto&) return type, which C++
+  // requires to be fully defined before any use - and this class's own
+  // private VRAM struct/vram member (below) is declared well after this
+  // point in the class body.
+  auto forceBlankVramWord(uint16 address, uint16 data) -> void;
+
 private:
   //ppu.cpp
   alwaysinline auto step() -> void;
@@ -175,5 +203,9 @@ private:
   friend class System;
   friend class PPUfast;
 };
+
+// Out-of-line: see forceBlankVramWord's own declaration/comment above for
+// why (VRAM::operator[]'s deduced return type has to be visible first).
+alwaysinline auto PPU::forceBlankVramWord(uint16 address, uint16 data) -> void { vram[address] = data; }
 
 extern PPU ppu;

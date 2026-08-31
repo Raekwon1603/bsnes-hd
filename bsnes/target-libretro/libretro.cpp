@@ -1249,3 +1249,41 @@ extern "C" RETRO_API void smwide_force_save(void)
 	if(!emulator || !emulator->loaded()) return;
 	program->save();
 }
+
+/* Custom export, same reasoning/resolution mechanism as smwide_write_wram
+ * above. Backs the second-screen SETUP tab's "HIDE MAIN HUD" toggle (see
+ * super_metroid-android's docs/retroarch-fork-notes.md) - flips
+ * g_smwide_hud_hidden (sfc/cpu/dma.cpp), which CPU::Channel::transfer
+ * checks on every DMA byte to blank Super Metroid's HUD tilemap/minimap-
+ * border writes on their way into VRAM, the same technique that project's
+ * own from-scratch SNES core uses (see dma.cpp's own long comment for the
+ * full explanation) - cosmetic only, WRAM and all other emulated state stay
+ * completely untouched, so this doesn't conflict with RetroAchievements
+ * hardcore mode. */
+/* g_smwide_hud_hidden and smwide_force_blank_hud are defined in
+ * sfc/cpu/dma.cpp, which is #included into cpu.cpp inside `namespace
+ * SuperFamicom { ... }` (bsnes's usual single-translation-unit-per-module
+ * style) - so they really live under SuperFamicom::, not the global
+ * namespace. */
+namespace SuperFamicom {
+	extern bool g_smwide_hud_hidden;
+	auto smwide_force_blank_hud() -> void;
+}
+
+extern "C" RETRO_API void smwide_set_hud_hidden(unsigned char hidden)
+{
+	bool wasHidden = SuperFamicom::g_smwide_hud_hidden;
+	SuperFamicom::g_smwide_hud_hidden = hidden != 0;
+	/* Only force-blank on the OFF->ON transition, matching
+	 * SM2_SetHudHidden's own real behavior (second_screen.c) - not every
+	 * call, and not when switching back off (nothing to force-restore;
+	 * the game's own real per-frame HUD writes take back over on their
+	 * own the moment transfer() stops substituting them). See
+	 * smwide_force_blank_hud's own comment (dma.cpp) for why this needs
+	 * to exist at all - InitializeHud's one-time minimap-border DMA (and
+	 * a room's first hud_tilemap upload) can easily have already
+	 * happened before the player ever reaches this toggle. */
+	if(hidden != 0 && !wasHidden && emulator && emulator->loaded()) {
+		SuperFamicom::smwide_force_blank_hud();
+	}
+}
