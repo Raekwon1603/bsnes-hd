@@ -54,5 +54,6 @@ LOCAL_SRC_FILES    := $(SRCFILES)
 LOCAL_CPPFLAGS     := -std=c++17 $(COREFLAGS)
 LOCAL_CFLAGS       := $(COREFLAGS)
 LOCAL_LDFLAGS      := -Wl,-version-script=$(SRCDIR)/bsnes/target-libretro/link.T
+LOCAL_LDLIBS        := -llog
 LOCAL_CPP_FEATURES := exceptions rtti
 include $(BUILD_SHARED_LIBRARY)

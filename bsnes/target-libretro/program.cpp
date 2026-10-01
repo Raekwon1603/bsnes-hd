@@ -1,3 +1,14 @@
+#ifdef PLATFORM_ANDROID
+#include <android/log.h>
+// RetroArch's own libretro_print callback is gated behind verbosity_is_enabled()
+// (runloop.c's libretro_log_cb), so plain RETRO_LOG_INFO calls go nowhere
+// unless the user has verbose logging on. For temporary load-path diagnostics
+// this logs straight to logcat instead, bypassing that gate.
+#define SMWIDE_LOG(...) __android_log_print(ANDROID_LOG_INFO, "RetroArch", __VA_ARGS__)
+#else
+#define SMWIDE_LOG(...)
+#endif
+
 #include <emulator/emulator.hpp>
 #include <sfc/interface/interface.hpp>
 #include <filter/filter.hpp>
@@ -168,8 +179,11 @@ auto Program::open(uint id, string name, vfs::file::mode mode, bool required) ->
 }
 
 auto Program::load() -> void {
+	SMWIDE_LOG("[smwide] Program::load: calling emulator->unload()\n");
 	emulator->unload();
+	SMWIDE_LOG("[smwide] Program::load: calling emulator->load()\n");
 	emulator->load();
+	SMWIDE_LOG("[smwide] Program::load: emulator->load() returned\n");
 
 	// per-game hack overrides
 	auto title = superFamicom.title;
@@ -231,9 +245,12 @@ auto Program::load() -> void {
 		if (title == "ニチブツ・アーケード・クラシックス") emulator->configure("Hacks/Entropy", "None");
 	}
 
+	SMWIDE_LOG("[smwide] Program::load: calling applySettingOverrides()\n");
 	Program::applySettingOverrides();
+	SMWIDE_LOG("[smwide] Program::load: calling emulator->power()\n");
 
 	emulator->power();
+	SMWIDE_LOG("[smwide] Program::load: emulator->power() returned, load() done\n");
 }
 
 auto Program::applySettingOverrides() -> void {
@@ -618,14 +635,17 @@ auto Program::loadFile(string location) -> vector<uint8_t>
 
 auto Program::loadSuperFamicom(string location) -> bool
 {
+	SMWIDE_LOG("[smwide] loadSuperFamicom: loading file %s\n", (const char*)location);
 	vector<uint8_t> rom;
 	rom = loadFile(location);
+	SMWIDE_LOG("[smwide] loadSuperFamicom: loadFile returned, size=%u\n", (unsigned)rom.size());
 
 	if(rom.size() < 0x8000) return false;
 
 	// soft patching (copied from standalone target)
 	// note: soft patching should be done via the libretro frontend
 	//       so this is only a workaround until that is possible
+	SMWIDE_LOG("[smwide] loadSuperFamicom: starting soft-patch chain\n");
 	if (!superFamicom.patched) {
 		bool p = applyPatchBPS(rom, location, "") || applyPatchIPS(rom, location, "");
 		superFamicom.patched = p;
@@ -642,6 +662,7 @@ auto Program::loadSuperFamicom(string location) -> bool
 		  }
 		}
 	}
+	SMWIDE_LOG("[smwide] loadSuperFamicom: soft-patch chain done, patched=%d\n", (int)superFamicom.patched);
 	// END OF soft patching (copied from standalone target)
 
 	// setting override loading (copied from standalone target)
@@ -671,14 +692,18 @@ auto Program::loadSuperFamicom(string location) -> bool
 		rom.resize(rom.size() - 512);
 	}
 
+	SMWIDE_LOG("[smwide] loadSuperFamicom: running heuristics\n");
 	auto heuristics = Heuristics::SuperFamicom(rom, location);
 	auto sha256 = Hash::SHA256(rom).digest();
 
 	superFamicom.title = heuristics.title();
 	superFamicom.region = heuristics.videoRegion();
 	superFamicom.manifest = heuristics.manifest();
+	SMWIDE_LOG("[smwide] loadSuperFamicom: heuristics done, title=%s\n", (const char*)superFamicom.title);
 
+	SMWIDE_LOG("[smwide] loadSuperFamicom: calling hackPatchMemory\n");
 	hackPatchMemory(rom);
+	SMWIDE_LOG("[smwide] loadSuperFamicom: hackPatchMemory done\n");
 	superFamicom.document = BML::unserialize(superFamicom.manifest);
 	superFamicom.location = location;
 
