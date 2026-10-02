@@ -611,6 +611,44 @@ auto Program::openRomBSMemory(string name, vfs::file::mode mode) -> shared_point
 	return {};
 }
 
+/* Reads a whole file through the frontend's VFS interface (g_vfs_iface,
+ * set in libretro.cpp's retro_set_environment()) instead of native file
+ * I/O. Needed for "saf://..." paths RetroArch hands out when the ROM was
+ * picked via Android's Storage Access Framework - those aren't real
+ * filesystem paths, file::read()/fopen() can't open them and silently
+ * return nothing. Returns an empty vector on any failure, same contract
+ * as file::read(). */
+static auto loadFileViaVfs(const string& location) -> vector<uint8_t>
+{
+	if (!g_vfs_iface) return {};
+
+	struct retro_vfs_file_handle* handle = g_vfs_iface->open(
+		(const char*)location, RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+	if (!handle) {
+		SMWIDE_LOG("[smwide] loadFileViaVfs: vfs open failed for %s\n", (const char*)location);
+		return {};
+	}
+
+	int64_t size = g_vfs_iface->size(handle);
+	if (size <= 0) {
+		SMWIDE_LOG("[smwide] loadFileViaVfs: vfs size<=0 (%lld)\n", (long long)size);
+		g_vfs_iface->close(handle);
+		return {};
+	}
+
+	vector<uint8_t> buffer;
+	buffer.resize((uint64_t)size);
+	int64_t bytesRead = g_vfs_iface->read(handle, buffer.data(), (uint64_t)size);
+	g_vfs_iface->close(handle);
+
+	if (bytesRead != size) {
+		SMWIDE_LOG("[smwide] loadFileViaVfs: short read, got %lld of %lld bytes\n", (long long)bytesRead, (long long)size);
+		return {};
+	}
+	SMWIDE_LOG("[smwide] loadFileViaVfs: success, %lld bytes\n", (long long)size);
+	return buffer;
+}
+
 auto Program::loadFile(string location) -> vector<uint8_t>
 {
 	if(Location::suffix(location).downcase() == ".zip") {
@@ -629,6 +667,16 @@ auto Program::loadFile(string location) -> vector<uint8_t>
 		return LZMA::extract(location);
 	}
 	else {
+		// "saf://..." (and any other frontend-URI-style path, signaled the
+		// same way libretro's own docs describe: contains "://") can't be
+		// opened by plain file I/O - try the frontend's VFS interface for
+		// those first, falling back to native file::read() for ordinary
+		// filesystem paths or if no VFS interface was ever negotiated.
+		bool isUriPath = (bool)location.find("://");
+		if (isUriPath && g_vfs_iface) {
+			auto result = loadFileViaVfs(location);
+			if (result.size() > 0) return result;
+		}
 		return file::read(location);
 	}
 }

@@ -21,6 +21,16 @@ static retro_input_poll_t input_poll;
 static retro_input_state_t input_state;
 static retro_log_printf_t libretro_print;
 
+/* Set once in retro_set_environment() if the frontend supports VFS (always
+ * true for RetroArch). Needed because RetroArch hands cores a "saf://..."
+ * URI instead of a real filesystem path when the ROM was picked through
+ * Android's Storage Access Framework (SD card, Downloads, etc. rather than
+ * app-private storage) - plain file::read()/fopen() can't open that URI at
+ * all and silently returns zero bytes, which is what Program::loadFile()
+ * was doing before this was wired up. Declared here (not static) so
+ * program.cpp, included by this file further below, can see it too. */
+struct retro_vfs_interface *g_vfs_iface = nullptr;
+
 /* Forward declaration - real definition is further down, next to
  * retro_get_memory_data/_size (search for its own comment there). Called
  * from the end of retro_run(), which is defined before that point in this
@@ -847,6 +857,16 @@ void retro_set_environment(retro_environment_t cb)
 	retro_log_callback log = {};
 	if (environ_cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log) && log.log)
 		libretro_print = log.log;
+
+	/* Must be queried here, before any ROM/save/system path is handed to
+	 * the core, per RETRO_ENVIRONMENT_GET_VFS_INTERFACE's own contract -
+	 * see libretro.h. Version 1 is all that's needed (open/close/size/read),
+	 * no need for the v2/v3 extras (truncate, stat, directory listing). */
+	struct retro_vfs_interface_info vfs_info = {};
+	vfs_info.required_interface_version = 1;
+	vfs_info.iface = nullptr;
+	if (environ_cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_info))
+		g_vfs_iface = vfs_info.iface;
 
 	set_environment_info(cb);
 }
