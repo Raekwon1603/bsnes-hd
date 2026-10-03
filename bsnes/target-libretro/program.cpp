@@ -649,6 +649,26 @@ static auto loadFileViaVfs(const string& location) -> vector<uint8_t>
 	return buffer;
 }
 
+/* Shared by loadFile() and the BPS/IPS sidecar patch lookups
+ * (applyPatchBPS/applyPatchIPS) - both derive a path from the ROM's own
+ * location (same scheme, since a sibling .bps/.ips next to a saf://... ROM
+ * is itself still a saf://... path) and need the same VFS-first fallback.
+ * Originally this logic only lived in loadFile() - the patch functions
+ * called file::read() directly and were missed, which is exactly why the
+ * widescreen patch silently failed to apply (leaving unpatched narrow-room
+ * layouts, no doors drawn where the patch would normally add them) even
+ * after the base ROM load itself was fixed to go through VFS - same root
+ * cause, different call site. */
+static auto readFileMaybeViaVfs(const string& location) -> vector<uint8_t>
+{
+	bool isUriPath = (bool)location.find("://");
+	if (isUriPath && g_vfs_iface) {
+		auto result = loadFileViaVfs(location);
+		if (result.size() > 0) return result;
+	}
+	return file::read(location);
+}
+
 auto Program::loadFile(string location) -> vector<uint8_t>
 {
 	if(Location::suffix(location).downcase() == ".zip") {
@@ -672,12 +692,7 @@ auto Program::loadFile(string location) -> vector<uint8_t>
 		// opened by plain file I/O - try the frontend's VFS interface for
 		// those first, falling back to native file::read() for ordinary
 		// filesystem paths or if no VFS interface was ever negotiated.
-		bool isUriPath = (bool)location.find("://");
-		if (isUriPath && g_vfs_iface) {
-			auto result = loadFileViaVfs(location);
-			if (result.size() > 0) return result;
-		}
-		return file::read(location);
+		return readFileMaybeViaVfs(location);
 	}
 }
 
@@ -714,8 +729,16 @@ auto Program::loadSuperFamicom(string location) -> bool
 	// END OF soft patching (copied from standalone target)
 
 	// setting override loading (copied from standalone target)
+	// .bso holds per-ROM setting overrides - for the widescreen hack this
+	// is what doubles VRAM size to fit the extra widescreen tile data
+	// (including door graphics). Same saf:// bug as the ROM/BPS patch
+	// above: file::read() can't open a saf://... override path, so this
+	// was silently loading nothing - the BPS patch applies correctly
+	// without it, but without the doubled VRAM the widescreen tile data
+	// has nowhere to go, which is exactly why doors vanish even though
+	// the patched ROM itself checksums correctly.
 	if(location.endsWith("/")) {
-		rso = file::read({location, "gamesettings.bso"});
+		rso = readFileMaybeViaVfs({location, "gamesettings.bso"});
 	} else if(location.iendsWith(".zip")) {
 		Decode::ZIP archive;
 		if(archive.open(location)) {
@@ -726,10 +749,10 @@ auto Program::loadSuperFamicom(string location) -> bool
 				}
 			}
 		}
-		if(!rso) rso = file::read({Location::path(location),
+		if(!rso) rso = readFileMaybeViaVfs({Location::path(location),
                   Location::prefix(Location::file(location)), ".bso"});
 	} else {
-		rso = file::read({Location::path(location),
+		rso = readFileMaybeViaVfs({Location::path(location),
          Location::prefix(Location::file(location)), ".bso"});
 	}
 	// END OF setting override loading (copied from standalone target)
@@ -1003,7 +1026,7 @@ auto Program::applyPatchBPS(vector<uint8_t>& input, string location, string suff
   vector<uint8_t> patch;
 
   if(location.endsWith("/")) {
-    patch = file::read({location, "patch.bps", suffix});
+    patch = readFileMaybeViaVfs({location, "patch.bps", suffix});
   } else if(location.iendsWith(".zip")) {
     Decode::ZIP archive;
     if(archive.open(location)) {
@@ -1014,10 +1037,10 @@ auto Program::applyPatchBPS(vector<uint8_t>& input, string location, string suff
         }
       }
     }
-    if(!patch) patch = file::read({Location::path(location),
+    if(!patch) patch = readFileMaybeViaVfs({Location::path(location),
                   Location::prefix(Location::file(location)), ".bps", suffix});
   } else {
-    patch = file::read({Location::path(location),
+    patch = readFileMaybeViaVfs({Location::path(location),
        Location::prefix(Location::file(location)), ".bps", suffix});
   }
 
@@ -1039,7 +1062,7 @@ auto Program::applyPatchIPS(vector<uint8_t>& data, string location, string suffi
   vector<uint8_t> patch;
 
   if(location.endsWith("/")) {
-    patch = file::read({location, "patch.ips", suffix});
+    patch = readFileMaybeViaVfs({location, "patch.ips", suffix});
   } else if(location.iendsWith(".zip")) {
     Decode::ZIP archive;
     if(archive.open(location)) {
@@ -1050,10 +1073,10 @@ auto Program::applyPatchIPS(vector<uint8_t>& data, string location, string suffi
         }
       }
     }
-    if(!patch) patch = file::read({Location::path(location),
+    if(!patch) patch = readFileMaybeViaVfs({Location::path(location),
                   Location::prefix(Location::file(location)), ".ips", suffix});
   } else {
-    patch = file::read({Location::path(location),
+    patch = readFileMaybeViaVfs({Location::path(location),
        Location::prefix(Location::file(location)), ".ips", suffix});
   }
 
